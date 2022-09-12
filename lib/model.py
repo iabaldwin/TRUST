@@ -32,6 +32,75 @@ from . import datasets_test
 
 torch.backends.cudnn.benchmark = True
 
+from PIL import Image
+import face_recognition
+from matplotlib import pyplot as plt
+import torchvision.transforms as transforms
+
+class FaceDetector():
+
+    _model = None
+    _faces = None
+    _image = None
+
+    def __init__(self, model="hog"):
+        super().__init__()
+        self._model = model
+
+    def face_locations(self, image: np.array) -> dict:
+        detections = face_recognition.face_locations(image, model=self._model)
+        faces = []
+        for index, face in enumerate(detections):
+            faces.append((index, face))
+        self._faces = faces
+        self._image = image
+        return faces
+
+    def random_crop(self):
+        random_crop = self._image[0:224, 0:224, :]
+        return random_crop
+
+    def face_pixels(self):
+        pixels = []
+        for index, box in self._faces:
+            top, right, bottom, left = box
+            slack = 100
+            shift = 20
+            face = self._image[top-slack+shift:bottom+slack+shift, left-slack:right+slack, :]
+            pixels.append(face)
+        return pixels
+
+    def draw(self):
+        draw = cv2.cvtColor(self._image, cv2.COLOR_RGB2BGR)
+
+        for idx, box in self._faces:
+            top, right, bottom, left = box
+            top_left = (int(left), int(top))
+            top_right = (int(right), int(top))
+            bottom_right = (int(right), int(bottom))
+            bottom_left = (int(left), int(bottom))
+            cv2.circle(draw, top_left, 4, (0, 0, 255), 2)
+            cv2.circle(draw, top_right, 4, (0, 0, 255), 2)
+            cv2.circle(draw, bottom_right, 4, (0, 0, 255), 2)
+            cv2.circle(draw, bottom_left, 4, (0, 0, 255), 2)
+            cv2.line(draw, top_left, top_right, (128, 128, 128), 1)
+            cv2.line(draw, top_right, bottom_right, (128, 128, 128), 1)
+            cv2.line(draw, bottom_right, bottom_left, (128, 128, 128), 1)
+            cv2.line(draw, bottom_left, top_left, (128, 128, 128), 1)
+
+            cv2.imshow('draw', draw)
+            cv2.waitKey()
+
+
+
+def show(imgs):
+    if not isinstance(imgs, list):
+        imgs = [imgs]
+    fig, axs = plt.subplots(ncols=len(imgs), squeeze=False)
+    for i, img in enumerate(imgs):
+        axs[0, i].imshow(img)
+        axs[0, i].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+    plt.show()
 
 class TRUST(object):
     def __init__(self, config, device='cuda'):
@@ -49,7 +118,7 @@ class TRUST(object):
 
         self.lightprobe_normal_images = F.interpolate(torch.from_numpy(np.load(self.config.lightprobe_normal_path)).float(), [self.config.image_size, self.config.image_size]).to(self.device)
         self.lightprobe_albedo_images = F.interpolate(torch.from_numpy(np.load(self.config.lightprobe_albedo_path)).float(), [self.config.image_size, self.config.image_size]).to(self.device)
-        
+
     def _create_model(self):
         # encoding
         self.E_flame = ResnetEncoder(outsize=self.n_param_deca).to(self.device) #out: 2048 shape - use deca
@@ -147,6 +216,20 @@ class TRUST(object):
         # coarse
         B, C, H, W = images.size()
 
+        # imgs = []
+        # for i in range(0, len(images)):
+            # example = images[i, :, :, :].cpu().numpy()
+            # example = np.rollaxis(example, 0, 3)
+            # imgs.append(example)
+        # show(imgs)
+
+        # imgs = []
+        # for i in range(0, len(scene_images)):
+            # example = scene_images[i, :, :, :].cpu().numpy()
+            # example = np.rollaxis(example, 0, 3)
+            # imgs.append(example)
+        # show(imgs)
+
         with torch.no_grad():
             parameters = self.E_flame(images)
         code_list = self.decompose_code(parameters)
@@ -203,6 +286,50 @@ class TRUST(object):
         grid_image = np.minimum(np.maximum(grid_image, 0), 255).astype(np.uint8)
         cv2.imwrite(savepath, grid_image)
 
+    def infer(self, image_path):
+        assert os.path.isfile(image_path)
+        image = Image.open(image_path).convert('RGB')
+        detector = FaceDetector()
+        faces = detector.face_locations(np.asarray(image))
+        # detector.draw()
+
+        face = detector.face_pixels()[0].transpose(2,0,1)
+        face = torch.from_numpy(face).float()
+        face /= 255.
+        resizer = transforms.Resize((224,224))
+        face = resizer(face)
+
+        random_crop = detector.random_crop().transpose(2,0,1)
+        random_crop = torch.from_numpy(random_crop).float()
+        random_crop /= 255.
+
+        images = torch.unsqueeze(face, 0).cuda()
+        scene_images = torch.unsqueeze(random_crop, 0).cuda()
+
+        scale_factors, normalized_sh_params, texcode, lightcode, albedo, ops, shape_images = self.encoding(images, scene_images)
+
+        predicted_images_alpha = ops['images'] * ops['alpha_images']
+        predicted_albedo_images = ops['albedo_images'] * ops['alpha_images']
+        predicted_shading = self.lightprobe_shading(self.SH_convert(lightcode))
+
+
+        visind = 0
+        print (scene_images[visind].shape)
+        visdict = {
+            'scene': scene_images,
+            'inputs': images,
+            'predicted_images': predicted_images_alpha,
+            'albedo_images': predicted_albedo_images,
+            'albedo': albedo,
+            # 'pred_lightprobe': (predicted_shading * self.lightprobe_albedo_images)[visind],
+            'pred_lightprobe': (predicted_shading * self.lightprobe_albedo_images)
+        }
+
+        image_name, _ = os.path.splitext(os.path.basename(image_path))
+        scene_name = image_name
+        savepath = '{}/{}/{}/{}_{}.jpg'.format(self.config.savefolder, self.config.dataname, 'test_images_vis', scene_name, image_name)
+        self.visualize(visdict, savepath)
+        print(savepath)
 
     def test(self, return_params=False):
         if self.config.test_data == 'benchmark_val':
@@ -232,7 +359,6 @@ class TRUST(object):
             scene_images = scene_images.view(-1, scene_images.shape[-3], scene_images.shape[-2], scene_images.shape[-1])
 
             scale_factors, normalized_sh_params, texcode, lightcode, albedo, ops, shape_images = self.encoding(images, scene_images)
-
             batch_size = images.shape[0]
 
             # images
@@ -241,13 +367,14 @@ class TRUST(object):
             predicted_shading = self.lightprobe_shading(self.SH_convert(lightcode))
             # import ipdb;ipdb.set_trace()
 
+            print (iter)
             for col_num in range(self.config.batch_size):
                 visind = np.arange(col_num, col_num+1)  # self.config.batch_size )
+                print (visind)
                 if self.config.test_data == 'benchmark_val':
                     visdict = {
                         'scene': scene_images[visind],
                         'inputs': images[visind],
-
                         'predicted_images': predicted_images_alpha[visind],
                         'albedo_images': predicted_albedo_images[visind],
                         'albedo': albedo[visind],

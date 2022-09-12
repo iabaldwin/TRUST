@@ -1,0 +1,6 @@
+FAIR_benchmark/
+dependencies/
+test_outputs/
+__pycache__
+*.pkl
+data/
